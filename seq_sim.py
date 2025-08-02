@@ -314,10 +314,34 @@ class Decoder(nn.Module):
         self.cmd_output = nn.Linear(hidden_size, cmd_vocab_size)
         self.addr_output = nn.Linear(hidden_size, len(ADDR_KEYS)) # Output normalized address vector
 
-    def forward(self, input_feature_vector, hidden):
-        # input_feature_vector: (batch, 1, concat_dim) - single time step input
-        # hidden: (num_layers, batch, hidden_size) - initial hidden state
-        gru_out, hidden = self.gru(input_feature_vector, hidden)
+    def forward(self, x, hidden):
+        # x is the raw feature vector (batch, 1, 9)
+        cmd_ids = x[:, :, 0].long()
+        die_ids = (x[:, :, 1] * MAX_ADDR['die']).round().long()
+        plane_ids = (x[:, :, 2] * MAX_ADDR['plane']).round().long()
+        block_vals = x[:, :, 3].unsqueeze(-1)
+        page_vals = x[:, :, 4].unsqueeze(-1)
+        is_block_erased_vals = x[:, :, 5].unsqueeze(-1)
+        is_page_written_vals = x[:, :, 6].unsqueeze(-1)
+        is_next_page_expected_vals = x[:, :, 7].unsqueeze(-1)
+        is_read_offset_valid_vals = x[:, :, 8].unsqueeze(-1)
+        
+        cmd_embed = self.cmd_embedding(cmd_ids)
+        die_embed = self.die_embedding(die_ids)
+        plane_embed = self.plane_embedding(plane_ids)
+        block_embed = self.block_proj(block_vals)
+        page_embed = self.page_proj(page_vals)
+        is_block_erased_embed = self.is_block_erased_proj(is_block_erased_vals)
+        is_page_written_embed = self.is_page_written_proj(is_page_written_vals)
+        is_next_page_expected_embed = self.is_next_page_expected_proj(is_next_page_expected_vals)
+        is_read_offset_valid_embed = self.is_read_offset_valid_proj(is_read_offset_valid_vals)
+        
+        combined = torch.cat([cmd_embed, die_embed, plane_embed, block_embed, page_embed,
+                              is_block_erased_embed, is_page_written_embed,
+                              is_next_page_expected_embed, is_read_offset_valid_embed], dim=2)
+        
+        # combined is now (batch, 1, 144)
+        gru_out, hidden = self.gru(combined, hidden)
         
         cmd_pred = self.cmd_output(gru_out.squeeze(1)) # (batch, cmd_vocab_size)
         addr_pred = self.addr_output(gru_out.squeeze(1)) # (batch, len(ADDR_KEYS))
@@ -523,15 +547,25 @@ def evaluate_model(model, dataloader):
     with torch.no_grad():
         for sequences, labels, strategies in dataloader:
             outputs = model(sequences).squeeze()
+            # Handle case where batch size is 1 and squeeze removes all dimensions
+            if outputs.dim() == 0:
+                outputs = outputs.unsqueeze(0)
+            if labels.dim() == 0:
+                labels = labels.unsqueeze(0)
+
             predicted = (outputs > 0.5).float()
             all_labels.extend(labels.cpu().numpy())
             all_predictions.extend(predicted.cpu().numpy())
             all_strategies.extend(strategies)
     
+    if not all_labels:
+        print("No data to evaluate.")
+        return
+
     # 전체 성능 지표
     tn, fp, fn, tp = confusion_matrix(all_labels, all_predictions).ravel()
     accuracy = accuracy_score(all_labels, all_predictions)
-    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_predictions, average='binary')
+    precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_predictions, average='binary', zero_division=0)
 
     print("\n--- Overall Model Evaluation Results (Classifier) ---")
     print(f"Confusion Matrix: [[TN: {tn}, FP: {fp}], [FN: {fn}, TP: {tp}]]")
@@ -545,28 +579,35 @@ def evaluate_model(model, dataloader):
     print("\n--- Evaluation by Corruption Strategy (Classifier) ---")
     unique_strategies = sorted(list(set(all_strategies)))
     for strategy in unique_strategies:
-        strategy_labels = [all_labels[i] for i, s in enumerate(all_strategies) if s == strategy]
-        strategy_predictions = [all_predictions[i] for i, s in enumerate(all_strategies) if s == strategy]
+        strategy_indices = [i for i, s in enumerate(all_strategies) if s == strategy]
+        if not strategy_indices: continue
+
+        strategy_labels = [all_labels[i] for i in strategy_indices]
+        strategy_predictions = [all_predictions[i] for i in strategy_indices]
+
+        acc = accuracy_score(strategy_labels, strategy_predictions)
         
-        if len(strategy_labels) == 0: continue
+        pos_label = 1 if strategy == 'valid' else 0
+        
+        prec, rec, f1_s, _ = precision_recall_fscore_support(strategy_labels, strategy_predictions, average='binary', pos_label=pos_label, zero_division=0)
 
-        if strategy == 'valid':
-            filtered_labels = [l for l in strategy_labels if l == 1]
-            filtered_predictions = [p for l, p in zip(strategy_labels, strategy_predictions) if l == 1]
-        else:
-            filtered_labels = [l for l in strategy_labels if l == 0]
-            filtered_predictions = [p for l, p in zip(strategy_labels, strategy_predictions) if l == 0]
-
-        if len(filtered_labels) == 0: continue
-
-        acc = accuracy_score(filtered_labels, filtered_predictions)
-        if strategy == 'valid':
-            prec, rec, f1_s, _ = precision_recall_fscore_support(filtered_labels, filtered_predictions, average='binary', pos_label=1, zero_division=0)
-        else:
-            prec, rec, f1_s, _ = precision_recall_fscore_support(filtered_labels, filtered_predictions, average='binary', pos_label=0, zero_division=0)
-
-        print(f"Strategy: {strategy:<15} | Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1-Score: {f1_s:.4f}")
+        print(f"Strategy: {strategy:<15} | Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1-Score: {f1_s:.4f} (Metrics for class {pos_label})")
     print("--------------------------------")
+
+# --- 생성 모델용 Collate 함수 ---
+def pad_collate_fn(batch):
+    # Sort batch by sequence length for potential use with PackedSequence
+    batch.sort(key=lambda x: len(x[0]), reverse=True)
+    sequences, target_cmds, target_addrs = zip(*batch)
+    
+    # Pad sequences
+    padded_sequences = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=0.0)
+    
+    # Stack targets
+    target_cmds = torch.tensor(target_cmds, dtype=torch.long)
+    target_addrs = torch.stack(target_addrs)
+    
+    return padded_sequences, target_cmds, target_addrs
 
 # --- 시퀀스 생성 함수 ---
 def generate_sequence(encoder, decoder, start_sequence, seq_len, validator, feature_extractor):
@@ -662,8 +703,8 @@ def main():
     gen_val_size = len(generative_dataset) - gen_train_size
     gen_train_dataset, gen_val_dataset = random_split(generative_dataset, [gen_train_size, gen_val_size])
 
-    gen_train_loader = DataLoader(gen_train_dataset, batch_size=32, shuffle=True)
-    gen_val_loader = DataLoader(gen_val_dataset, batch_size=32, shuffle=False)
+    gen_train_loader = DataLoader(gen_train_dataset, batch_size=32, shuffle=True, collate_fn=pad_collate_fn)
+    gen_val_loader = DataLoader(gen_val_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
 
     # --- 생성 모델 초기화 및 학습 ---
     embedding_dim_gen = 16
