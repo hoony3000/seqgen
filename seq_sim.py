@@ -404,7 +404,7 @@ class StructuredEventModel(nn.Module):
         return self.sigmoid(out)
 
 # --- 모델 학습 (가중치 감쇠 및 조기 종료 추가) ---
-def train_model(model, train_loader, val_loader, epochs=100, lr=0.0001, weight_decay=1e-4, patience=10):
+def train_model(model, train_loader, val_loader, device, epochs=100, lr=0.0001, weight_decay=1e-4, patience=10):
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     best_val_loss = float('inf')
@@ -415,6 +415,7 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.0001, weight_d
         model.train()
         train_loss, train_correct, train_total = 0, 0, 0
         for sequences, labels, _ in train_loader: # Added _ for strategy
+            sequences, labels = sequences.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = model(sequences).squeeze()
             loss = criterion(outputs, labels)
@@ -432,6 +433,7 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.0001, weight_d
         val_loss, val_correct, val_total = 0, 0, 0
         with torch.no_grad():
             for sequences, labels, _ in val_loader: # Added _ for strategy
+                sequences, labels = sequences.to(device), labels.to(device)
                 outputs = model(sequences).squeeze()
                 loss = criterion(outputs, labels)
                 val_loss += loss.item()
@@ -460,7 +462,7 @@ def train_model(model, train_loader, val_loader, epochs=100, lr=0.0001, weight_d
         model.load_state_dict(best_model_state)
 
 # --- 생성 모델 학습 ---
-def train_generative_model(encoder, decoder, train_loader, val_loader, epochs=100, lr=0.0001, weight_decay=1e-4, patience=10):
+def train_generative_model(encoder, decoder, train_loader, val_loader, device, epochs=100, lr=0.0001, weight_decay=1e-4, patience=10):
     encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=lr, weight_decay=weight_decay)
     decoder_optimizer = torch.optim.Adam(decoder.parameters(), lr=lr, weight_decay=weight_decay)
     
@@ -478,6 +480,7 @@ def train_generative_model(encoder, decoder, train_loader, val_loader, epochs=10
         total_loss = 0
 
         for input_sequences, target_cmds, target_addrs in train_loader:
+            input_sequences, target_cmds, target_addrs = input_sequences.to(device), target_cmds.to(device), target_addrs.to(device)
             encoder_optimizer.zero_grad()
             decoder_optimizer.zero_grad()
 
@@ -509,6 +512,7 @@ def train_generative_model(encoder, decoder, train_loader, val_loader, epochs=10
         val_loss = 0
         with torch.no_grad():
             for input_sequences, target_cmds, target_addrs in val_loader:
+                input_sequences, target_cmds, target_addrs = input_sequences.to(device), target_cmds.to(device), target_addrs.to(device)
                 context_vector, encoder_hidden = encoder(input_sequences)
                 decoder_input = input_sequences[:, -1, :].unsqueeze(1)
                 decoder_hidden = encoder_hidden
@@ -541,11 +545,12 @@ def train_generative_model(encoder, decoder, train_loader, val_loader, epochs=10
         decoder.load_state_dict(best_decoder_state)
 
 # --- 모델 평가 (분류 모델용) ---
-def evaluate_model(model, dataloader):
+def evaluate_model(model, dataloader, device):
     model.eval()
     all_labels, all_predictions, all_strategies = [], [], []
     with torch.no_grad():
         for sequences, labels, strategies in dataloader:
+            sequences, labels = sequences.to(device), labels.to(device)
             outputs = model(sequences).squeeze()
             # Handle case where batch size is 1 and squeeze removes all dimensions
             if outputs.dim() == 0:
@@ -610,7 +615,7 @@ def pad_collate_fn(batch):
     return padded_sequences, target_cmds, target_addrs
 
 # --- 시퀀스 생성 함수 ---
-def generate_sequence(encoder, decoder, start_sequence, seq_len, validator, feature_extractor):
+def generate_sequence(encoder, decoder, start_sequence, seq_len, validator, feature_extractor, device):
     encoder.eval()
     decoder.eval()
     generated_sequence = copy.deepcopy(start_sequence)
@@ -627,7 +632,7 @@ def generate_sequence(encoder, decoder, start_sequence, seq_len, validator, feat
                 new_features = temp_feature_extractor.extract_features_and_update_state(cmd_id, addr_vec)
                 input_tensor.append([cmd_id] + addr_vec + new_features)
             
-            input_tensor = torch.tensor([input_tensor], dtype=torch.float32)
+            input_tensor = torch.tensor([input_tensor], dtype=torch.float32).to(device)
 
             context_vector, encoder_hidden = encoder(input_tensor)
             
@@ -653,6 +658,10 @@ def generate_sequence(encoder, decoder, start_sequence, seq_len, validator, feat
 
 # --- Main ---
 def main():
+    # --- Device 설정 ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"--- Using device: {device} ---")
+
     # --- 데이터 생성 (분류 모델용) ---
     generator = ContrastiveDataGenerator(seq_len=50, num_blocks=3, read_offset_limit=5)
     num_samples = 2000
@@ -679,13 +688,13 @@ def main():
         die_vocab_size=MAX_ADDR['die'] + 1,
         plane_vocab_size=MAX_ADDR['plane'] + 1,
         embedding_dim=16, hidden_size=64, num_layers=2, output_size=1, dropout=0.4
-    )
+    ).to(device)
     
     print("\n--- Starting Classifier Model Training ---")
-    train_model(classifier_model, train_loader_cls, val_loader_cls, epochs=100, lr=0.0001, weight_decay=1e-4, patience=10)
+    train_model(classifier_model, train_loader_cls, val_loader_cls, device, epochs=100, lr=0.0001, weight_decay=1e-4, patience=10)
 
     print("\n--- Evaluating Classifier Model on Test Set ---")
-    evaluate_model(classifier_model, test_loader_cls)
+    evaluate_model(classifier_model, test_loader_cls, device)
 
     save_path_classifier = "classifier_model_250802.pth"
     torch.save(classifier_model.state_dict(), save_path_classifier)
@@ -719,7 +728,7 @@ def main():
         hidden_size=hidden_size_gen,
         num_layers=num_layers_gen,
         dropout=0.4
-    )
+    ).to(device)
 
     decoder = Decoder(
         cmd_vocab_size=len(CMD_VOCAB),
@@ -729,10 +738,10 @@ def main():
         hidden_size=hidden_size_gen,
         num_layers=num_layers_gen,
         dropout=0.4
-    )
+    ).to(device)
 
     print("\n--- Starting Generative Model Training ---")
-    train_generative_model(encoder, decoder, gen_train_loader, gen_val_loader, epochs=50, lr=0.0001, weight_decay=1e-4, patience=10)
+    train_generative_model(encoder, decoder, gen_train_loader, gen_val_loader, device, epochs=50, lr=0.0001, weight_decay=1e-4, patience=10)
 
     save_path_generative_encoder = "generative_encoder_250802.pth"
     save_path_generative_decoder = "generative_decoder_250802.pth"
@@ -753,7 +762,7 @@ def main():
         start_sequence = [(initial_cmd_id, initial_addr_vec)]
 
         # Generate sequence
-        generated_seq = generate_sequence(encoder, decoder, start_sequence, generated_seq_len, validator, StatefulFeatureExtractor(MAX_ADDR, CMD_VOCAB, 5))
+        generated_seq = generate_sequence(encoder, decoder, start_sequence, generated_seq_len, validator, StatefulFeatureExtractor(MAX_ADDR, CMD_VOCAB, 5), device)
         
         # Validate generated sequence
         is_valid = True
