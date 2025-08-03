@@ -190,52 +190,29 @@ class StatefulFeatureExtractor:
 
 # --- 데이터셋 클래스 (분류 모델용) ---
 class NANDSequenceDataset(Dataset):
-    def __init__(self, sequences, labels, strategies=None):
-        self.sequences = sequences
+    def __init__(self, enriched_sequences, labels, strategies):
+        self.enriched_sequences = enriched_sequences
         self.labels = labels
-        self.strategies = strategies if strategies is not None else ['valid'] * len(sequences)
+        self.strategies = strategies if strategies is not None else ['valid'] * len(enriched_sequences)
 
     def __len__(self):
-        return len(self.sequences)
+        return len(self.enriched_sequences)
 
     def __getitem__(self, idx):
-        original_sequence, label, strategy = self.sequences[idx], self.labels[idx], self.strategies[idx]
-        
-        feature_extractor = StatefulFeatureExtractor(MAX_ADDR, CMD_VOCAB, 5) # read_offset_limit from main
-        
-        enriched_seq_data = []
-        for cmd_id, addr_vec in original_sequence:
-            new_features = feature_extractor.extract_features_and_update_state(cmd_id, addr_vec)
-            enriched_seq_data.append([cmd_id] + addr_vec + new_features)
-
-        return torch.tensor(enriched_seq_data, dtype=torch.float32), torch.tensor(label, dtype=torch.float32), strategy
+        # The data is already a tensor, just return it
+        return self.enriched_sequences[idx], self.labels[idx], self.strategies[idx]
 
 # --- 데이터셋 클래스 (생성 모델용으로 수정) ---
 class GenerativeNANDSequenceDataset(Dataset):
-    def __init__(self, sequences):
-        self.sequences = []
-        for seq in sequences:
-            # 각 시퀀스에서 (t-1)까지의 입력과 t번째 타겟을 생성
-            for i in range(1, len(seq)):
-                input_seq = seq[:i]
-                target_cmd = seq[i][0] # t번째 명령
-                target_addr = torch.tensor(seq[i][1], dtype=torch.float32) # t번째 주소 벡터
-                self.sequences.append((input_seq, target_cmd, target_addr))
+    def __init__(self, processed_sequences):
+        # processed_sequences is a list of tuples: (enriched_input_seq_tensor, target_cmd, target_addr_tensor)
+        self.sequences = processed_sequences
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        input_seq, target_cmd, target_addr = self.sequences[idx]
-        
-        # StatefulFeatureExtractor를 사용하여 입력 시퀀스 풍부화
-        feature_extractor = StatefulFeatureExtractor(MAX_ADDR, CMD_VOCAB, 5) # read_offset_limit from main
-        enriched_input_seq = []
-        for cmd_id, addr_vec in input_seq:
-            new_features = feature_extractor.extract_features_and_update_state(cmd_id, addr_vec)
-            enriched_input_seq.append([cmd_id] + addr_vec + new_features)
-
-        return torch.tensor(enriched_input_seq, dtype=torch.float32), target_cmd, target_addr
+        return self.sequences[idx]
 
 # --- 모델 아키텍처 (인코더-디코더) ---
 class Attention(nn.Module):
@@ -614,6 +591,14 @@ def pad_collate_fn(batch):
     
     return padded_sequences, target_cmds, target_addrs
 
+# --- 분류 모델용 Collate 함수 ---
+def classifier_collate_fn(batch):
+    sequences, labels, strategies = zip(*batch)
+    # No need to sort by length for classifier
+    padded_sequences = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=0.0)
+    labels = torch.tensor(labels, dtype=torch.float32)
+    return padded_sequences, labels, strategies
+
 # --- 시퀀스 생성 함수 ---
 def generate_sequence(encoder, decoder, start_sequence, seq_len, validator, feature_extractor, device):
     encoder.eval()
@@ -662,26 +647,50 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- Using device: {device} ---")
 
-    # --- 데이터 생성 (분류 모델용) ---
+    # --- 하이퍼파라미터 ---
+    # A100 GPU의 성능을 최대한 활용하기 위해 배치 크기를 늘리고, 데이터 로더 워커 수를 설정합니다.
+    CLASSIFIER_BATCH_SIZE = 32
+    GENERATOR_BATCH_SIZE = 32
+    # CLASSIFIER_BATCH_SIZE = 1024
+    # GENERATOR_BATCH_SIZE = 1024
+    NUM_DATALOADER_WORKERS = 4 # CPU 코어 수에 맞게 조절하세요.
+
+    # --- 데이터 생성 (공통) ---
     generator = ContrastiveDataGenerator(seq_len=50, num_blocks=3, read_offset_limit=5)
-    num_samples = 2000
+    num_samples = 1024*2 # 필요시 샘플 수를 늘려도 좋습니다.
+
+    # --- 분류 모델용 데이터 준비 ---
     sequences_classifier, labels_classifier, strategies_classifier = [], [], []
-    print(f"Generating {num_samples} samples for classifier...")
+    print(f"Generating {num_samples} raw samples for classifier...")
     for _ in range(num_samples // 2):
         valid_seq, valid_label = generator.generate_valid()
         sequences_classifier.append(valid_seq); labels_classifier.append(valid_label); strategies_classifier.append('valid')
         invalid_seq, invalid_label, corruption_strategy = generator.generate_invalid()
         sequences_classifier.append(invalid_seq); labels_classifier.append(invalid_label); strategies_classifier.append(corruption_strategy)
 
-    full_dataset_classifier = NANDSequenceDataset(sequences_classifier, labels_classifier, strategies_classifier)
+    # --- 데이터 전처리 (분류 모델) ---
+    # 학습 전에 모든 데이터의 특징을 미리 추출하여 텐서로 변환합니다.
+    # 이 과정은 학습 중 데이터 로딩 병목을 제거하여 GPU 활용률을 높입니다.
+    print("Preprocessing data for classifier...")
+    enriched_sequences_classifier = []
+    for seq in sequences_classifier:
+        feature_extractor = StatefulFeatureExtractor(MAX_ADDR, CMD_VOCAB, 5) # 각 시퀀스마다 상태 초기화
+        enriched_seq = []
+        for cmd_id, addr_vec in seq:
+            new_features = feature_extractor.extract_features_and_update_state(cmd_id, addr_vec)
+            enriched_seq.append([cmd_id] + addr_vec + new_features)
+        enriched_sequences_classifier.append(torch.tensor(enriched_seq, dtype=torch.float32))
+
+    full_dataset_classifier = NANDSequenceDataset(enriched_sequences_classifier, labels_classifier, strategies_classifier)
     train_size_cls = int(0.7 * len(full_dataset_classifier))
     val_size_cls = int(0.15 * len(full_dataset_classifier))
     test_size_cls = len(full_dataset_classifier) - train_size_cls - val_size_cls
     train_dataset_cls, val_dataset_cls, test_dataset_cls = random_split(full_dataset_classifier, [train_size_cls, val_size_cls, test_size_cls])
 
-    train_loader_cls = DataLoader(train_dataset_cls, batch_size=32, shuffle=True)
-    val_loader_cls = DataLoader(val_dataset_cls, batch_size=32, shuffle=False)
-    test_loader_cls = DataLoader(test_dataset_cls, batch_size=32, shuffle=False)
+    # 최적화된 DataLoader 사용
+    train_loader_cls = DataLoader(train_dataset_cls, batch_size=CLASSIFIER_BATCH_SIZE, shuffle=True, num_workers=NUM_DATALOADER_WORKERS, pin_memory=True, collate_fn=classifier_collate_fn)
+    val_loader_cls = DataLoader(val_dataset_cls, batch_size=CLASSIFIER_BATCH_SIZE, shuffle=False, num_workers=NUM_DATALOADER_WORKERS, pin_memory=True, collate_fn=classifier_collate_fn)
+    test_loader_cls = DataLoader(test_dataset_cls, batch_size=CLASSIFIER_BATCH_SIZE, shuffle=False, num_workers=NUM_DATALOADER_WORKERS, pin_memory=True, collate_fn=classifier_collate_fn)
 
     classifier_model = StructuredEventModel(
         cmd_vocab_size=len(CMD_VOCAB),
@@ -700,20 +709,38 @@ def main():
     torch.save(classifier_model.state_dict(), save_path_classifier)
     print(f"\n--- Best classifier model saved to {save_path_classifier} ---")
 
-    # --- 데이터 생성 (생성 모델용) ---
-    sequences_generative = []
-    print(f"Generating {num_samples} samples for generative model...")
+    # --- 생성 모델용 데이터 준비 ---
+    sequences_generative_raw = []
+    print(f"\nGenerating {num_samples} raw samples for generative model...")
     for _ in range(num_samples):
         valid_seq, _ = generator.generate_valid()
-        sequences_generative.append(valid_seq)
+        sequences_generative_raw.append(valid_seq)
     
-    generative_dataset = GenerativeNANDSequenceDataset(sequences_generative)
+    # --- 데이터 전처리 (생성 모델) ---
+    print("Preprocessing data for generative model...")
+    processed_sequences_generative = []
+    for seq in sequences_generative_raw:
+        feature_extractor = StatefulFeatureExtractor(MAX_ADDR, CMD_VOCAB, 5) # 상태 초기화
+        enriched_full_seq = []
+        for cmd_id, addr_vec in seq:
+            new_features = feature_extractor.extract_features_and_update_state(cmd_id, addr_vec)
+            enriched_full_seq.append([cmd_id] + addr_vec + new_features)
+        enriched_full_seq_tensor = torch.tensor(enriched_full_seq, dtype=torch.float32)
+
+        for i in range(1, len(enriched_full_seq_tensor)):
+            input_tensor = enriched_full_seq_tensor[:i]
+            target_cmd = seq[i][0]
+            target_addr = torch.tensor(seq[i][1], dtype=torch.float32)
+            processed_sequences_generative.append((input_tensor, target_cmd, target_addr))
+
+    generative_dataset = GenerativeNANDSequenceDataset(processed_sequences_generative)
     gen_train_size = int(0.8 * len(generative_dataset))
     gen_val_size = len(generative_dataset) - gen_train_size
     gen_train_dataset, gen_val_dataset = random_split(generative_dataset, [gen_train_size, gen_val_size])
 
-    gen_train_loader = DataLoader(gen_train_dataset, batch_size=32, shuffle=True, collate_fn=pad_collate_fn)
-    gen_val_loader = DataLoader(gen_val_dataset, batch_size=32, shuffle=False, collate_fn=pad_collate_fn)
+    # 최적화된 DataLoader 사용
+    gen_train_loader = DataLoader(gen_train_dataset, batch_size=GENERATOR_BATCH_SIZE, shuffle=True, collate_fn=pad_collate_fn, num_workers=NUM_DATALOADER_WORKERS, pin_memory=True)
+    gen_val_loader = DataLoader(gen_val_dataset, batch_size=GENERATOR_BATCH_SIZE, shuffle=False, collate_fn=pad_collate_fn, num_workers=NUM_DATALOADER_WORKERS, pin_memory=True)
 
     # --- 생성 모델 초기화 및 학습 ---
     embedding_dim_gen = 16
