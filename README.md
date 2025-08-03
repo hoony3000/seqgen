@@ -8,12 +8,6 @@ NAND Sequence Generator는 NAND 플래시 메모리 작업의 임의 순차열�
 
 이 프로젝트는 Python 3.10 이상이 필요합니다.
 
-저장소를 복제하고 다음 명령을 사용하여 종속성을 설치하십시오.
-
-```bash
-pip install -e .
-```
-
 ## 사용법
 
 순차열을 생성하려면 `main.py` 스크립트를 실행하십시오.
